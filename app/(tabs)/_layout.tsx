@@ -1,19 +1,117 @@
-import React, { useEffect, useState } from 'react';
-import { StyleSheet, View, Image } from 'react-native';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
+import {
+  StyleSheet,
+  View,
+  Image,
+  TouchableOpacity,
+  Animated,
+  DeviceEventEmitter,
+  Platform,
+  useColorScheme,
+} from 'react-native';
 import { Tabs, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { supabase } from '../../lib/supabase';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { backend } from '../../lib/backend';
 
-const THEME_COLOR = '#10b981';
+const THEME_STORAGE_KEY = 'app_theme_mode_v1';
+const THEME_CHANGED_EVENT = 'app-theme-changed';
+type ThemeMode = 'light' | 'dark' | 'system';
+type TabRouteName = 'index' | 'watch' | 'create' | 'connect' | 'profile';
 
 let cachedAvatarUrl: string | null = null;
 let cachedUserId: string | null = null;
 
+function DockTabButton({
+  active,
+  onPress,
+  activeColor,
+  inactiveColor,
+  pillBg,
+  iconName,
+  activeIconName,
+  children,
+}: {
+  active: boolean;
+  onPress: () => void;
+  activeColor: string;
+  inactiveColor: string;
+  pillBg: string;
+  iconName?: keyof typeof Ionicons.glyphMap;
+  activeIconName?: keyof typeof Ionicons.glyphMap;
+  children?: React.ReactNode;
+}) {
+  const scaleAnim = useRef(new Animated.Value(1)).current;
+
+  const handlePressIn = () => {
+    Animated.spring(scaleAnim, {
+      toValue: 0.88,
+      useNativeDriver: true,
+      speed: 35,
+      bounciness: 6,
+    }).start();
+  };
+
+  const handlePressOut = () => {
+    Animated.spring(scaleAnim, {
+      toValue: 1,
+      useNativeDriver: true,
+      speed: 28,
+      bounciness: 8,
+    }).start();
+  };
+
+  return (
+    <TouchableOpacity
+      activeOpacity={0.85}
+      onPress={onPress}
+      onPressIn={handlePressIn}
+      onPressOut={handlePressOut}
+      style={styles.tabSlot}
+    >
+      <Animated.View
+        style={[
+          styles.tabInner,
+          { transform: [{ scale: scaleAnim }] },
+        ]}
+      >
+        {children ??
+          (iconName && (
+            <Ionicons
+              name={active && activeIconName ? activeIconName : iconName}
+              size={27}
+              color={active ? activeColor : inactiveColor}
+            />
+          ))}
+      </Animated.View>
+    </TouchableOpacity>
+  );
+}
+
 export default function TabsLayout() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const bottomPad = Math.max(insets.bottom, 10);
+  const systemScheme = useColorScheme();
+  const bottomSafePad =
+    Platform.OS === 'android' ? insets.bottom : Math.max(insets.bottom, 6);
+
+  const [themeMode, setThemeMode] = useState<ThemeMode>('system');
+  const isDark =
+    themeMode === 'dark' || (themeMode === 'system' && systemScheme === 'dark');
+
+  const palette = useMemo(
+    () => ({
+      dockBg: isDark ? '#09090b' : '#ffffff',
+      dockBorder: isDark ? '#27272a' : '#e4e4e7',
+      activeIcon: isDark ? '#fafafa' : '#09090b',
+      inactiveIcon: isDark ? '#a1a1aa' : '#71717a',
+      activePill: isDark ? '#27272a' : '#f4f4f5',
+      ringBorder: isDark ? '#fafafa' : '#09090b',
+      shadow: isDark ? '#000000' : '#09090b',
+    }),
+    [isDark]
+  );
 
   const [avatarUrl, setAvatarUrl] = useState<string | null>(cachedAvatarUrl);
   const [currentUserId, setCurrentUserId] = useState<string | null>(
@@ -21,46 +119,43 @@ export default function TabsLayout() {
   );
 
   useEffect(() => {
+    AsyncStorage.getItem(THEME_STORAGE_KEY)
+      .then((saved) => {
+        if (saved === 'light' || saved === 'dark' || saved === 'system') {
+          setThemeMode(saved);
+        }
+      })
+      .catch(() => {});
+
+    const sub = DeviceEventEmitter.addListener(
+      THEME_CHANGED_EVENT,
+      (mode: ThemeMode) => {
+        if (mode === 'light' || mode === 'dark' || mode === 'system') {
+          setThemeMode(mode);
+        }
+      }
+    );
+    return () => sub.remove();
+  }, []);
+
+  useEffect(() => {
     let active = true;
 
     const loadUserAvatar = async () => {
       try {
-        const { data: authData } = await supabase.auth.getUser();
-        const user = authData?.user;
+        const user = await backend.auth.getCurrentUser();
         if (!user || !active) return;
 
         cachedUserId = user.id;
         setCurrentUserId(user.id);
 
-        const metaAvatar =
-          typeof user.user_metadata?.avatar_url === 'string' &&
-          user.user_metadata.avatar_url.trim()
-            ? user.user_metadata.avatar_url.trim()
+        const resolved =
+          typeof user.avatarUrl === 'string' && user.avatarUrl.trim()
+            ? user.avatarUrl.trim()
             : null;
 
-        if (metaAvatar && !cachedAvatarUrl && active) {
-          cachedAvatarUrl = metaAvatar;
-          setAvatarUrl(metaAvatar);
-        }
-
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('avatar_url')
-          .eq('id', user.id)
-          .maybeSingle();
-
-        if (!active) return;
-
-        const dbAvatar =
-          typeof profile?.avatar_url === 'string' && profile.avatar_url.trim()
-            ? profile.avatar_url.trim()
-            : null;
-
-        const resolved = dbAvatar || metaAvatar;
-        if (resolved) {
-          cachedAvatarUrl = resolved;
-          setAvatarUrl(resolved);
-        }
+        cachedAvatarUrl = resolved;
+        setAvatarUrl(resolved);
       } catch {
         // Keep cached or fallback icon if fetch fails
       }
@@ -68,174 +163,222 @@ export default function TabsLayout() {
 
     void loadUserAvatar();
 
-    const { data: authListener } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
-        if (!session?.user) {
-          cachedAvatarUrl = null;
-          cachedUserId = null;
-          if (active) {
-            setAvatarUrl(null);
-            setCurrentUserId(null);
-          }
-          return;
-        }
-        void loadUserAvatar();
+    const avatarSub = DeviceEventEmitter.addListener(
+      'profile-avatar-updated',
+      (payload?: { avatarUrl?: string; userId?: string }) => {
+        if (!active) return;
+        const activeUid = currentUserId || cachedUserId;
+        if (payload?.userId && activeUid && payload.userId !== activeUid) return;
+
+        const nextUrl =
+          typeof payload?.avatarUrl === 'string' && payload.avatarUrl.trim()
+            ? payload.avatarUrl.trim()
+            : null;
+
+        cachedAvatarUrl = nextUrl;
+        setAvatarUrl(nextUrl);
       }
     );
 
+    const unsubscribeAuth = backend.auth.onAuthStateChange((isSignedIn) => {
+      if (!isSignedIn) {
+        cachedAvatarUrl = null;
+        cachedUserId = null;
+        if (active) {
+          setAvatarUrl(null);
+          setCurrentUserId(null);
+        }
+        return;
+      }
+      void loadUserAvatar();
+    });
+
     return () => {
       active = false;
-      authListener?.subscription?.unsubscribe();
+      avatarSub.remove();
+      unsubscribeAuth();
     };
-  }, []);
-
-  const openOwnProfile = () => {
-    const uid = currentUserId || cachedUserId;
-    const target = uid
-      ? ({ pathname: '/profile', params: { userId: uid } } as const)
-      : ('/profile' as const);
-
-    try {
-      router.replace(target as never);
-    } catch {
-      router.push(target as never);
-    }
-  };
+  }, [currentUserId]);
 
   return (
     <Tabs
-      screenOptions={{
-        headerShown: false,
-        tabBarShowLabel: false,
-        tabBarActiveTintColor: THEME_COLOR,
-        tabBarInactiveTintColor: '#64748b',
-        tabBarStyle: {
-          backgroundColor: '#ffffff',
-          borderTopWidth: 1,
-          borderTopColor: '#e2e8f0',
-          height: 52 + bottomPad,
-          paddingTop: 6,
-          paddingBottom: bottomPad,
-        },
+      screenOptions={{ headerShown: false }}
+      tabBar={(props) => {
+        const tabState = props?.state;
+        const activeIndex =
+          typeof tabState?.index === 'number' ? tabState.index : 0;
+        const currentRoute =
+          (tabState?.routes?.[activeIndex]?.name as TabRouteName | undefined) ??
+          'index';
+
+        const navigateToTab = (routeName: TabRouteName) => {
+          const targetRoute = tabState?.routes?.find(
+            (r) => r.name === routeName
+          );
+          if (targetRoute?.key && typeof props?.navigateToTab === 'function') {
+            const event = props.emitter?.emit({
+              type: 'tabPress',
+              target: targetRoute.key,
+              canPreventDefault: true,
+            });
+            if (!event?.defaultPrevented) {
+              props.navigateToTab(targetRoute.key);
+            }
+            return;
+          }
+          const href =
+            routeName === 'index'
+              ? '/(tabs)'
+              : (`/(tabs)/${routeName}` as const);
+          router.navigate(href as never);
+        };
+
+        const handleOpenOwnProfile = () => {
+          DeviceEventEmitter.emit('profile-tab-pressed');
+          navigateToTab('profile');
+        };
+
+        return (
+          <View
+            pointerEvents="box-none"
+            style={[styles.floatingWrapper, { bottom: 0 }]}
+          >
+            <View
+              style={[
+                styles.capsuleDock,
+                {
+                  backgroundColor: palette.dockBg,
+                  borderTopColor: palette.dockBorder,
+                  height: 58 + bottomSafePad,
+                  paddingBottom: bottomSafePad,
+                },
+              ]}
+            >
+              <DockTabButton
+                active={currentRoute === 'index'}
+                onPress={() => navigateToTab('index')}
+                activeColor={palette.activeIcon}
+                inactiveColor={palette.inactiveIcon}
+                pillBg={palette.activePill}
+                iconName="home-outline"
+                activeIconName="home"
+              />
+
+              <DockTabButton
+                active={currentRoute === 'watch'}
+                onPress={() => navigateToTab('watch')}
+                activeColor={palette.activeIcon}
+                inactiveColor={palette.inactiveIcon}
+                pillBg={palette.activePill}
+                iconName="play-circle-outline"
+                activeIconName="play-circle"
+              />
+
+              <DockTabButton
+                active={currentRoute === 'create'}
+                onPress={() => navigateToTab('create')}
+                activeColor={palette.activeIcon}
+                inactiveColor={palette.inactiveIcon}
+                pillBg={palette.activePill}
+                iconName="add-circle-outline"
+                activeIconName="add-circle"
+              />
+
+              <DockTabButton
+                active={currentRoute === 'connect'}
+                onPress={() => navigateToTab('connect')}
+                activeColor={palette.activeIcon}
+                inactiveColor={palette.inactiveIcon}
+                pillBg={palette.activePill}
+                iconName="people-outline"
+                activeIconName="people"
+              />
+
+              <DockTabButton
+                active={currentRoute === 'profile'}
+                onPress={handleOpenOwnProfile}
+                activeColor={palette.activeIcon}
+                inactiveColor={palette.inactiveIcon}
+                pillBg={palette.activePill}
+                iconName="person-outline"
+                activeIconName="person"
+              >
+                {avatarUrl ? (
+                  <View
+                    style={[
+                      styles.avatarFrame,
+                      currentRoute === 'profile' && {
+                        width: 32,
+                        height: 32,
+                        borderRadius: 16,
+                        borderWidth: 2,
+                        padding: 1.5,
+                        borderColor: palette.ringBorder,
+                      },
+                    ]}
+                  >
+                    <Image
+                      source={{ uri: avatarUrl }}
+                      style={styles.avatarPic}
+                    />
+                  </View>
+                ) : undefined}
+              </DockTabButton>
+            </View>
+          </View>
+        );
       }}
     >
-      <Tabs.Screen
-        name="index"
-        options={{
-          title: 'Home',
-          tabBarIcon: ({ color, focused }) => (
-            <Ionicons
-              name={focused ? 'home' : 'home-outline'}
-              size={26}
-              color={color}
-            />
-          ),
-        }}
-      />
-
-      <Tabs.Screen
-        name="watch"
-        options={{
-          title: 'Watch',
-          tabBarIcon: ({ color, focused }) => (
-            <Ionicons
-              name={focused ? 'play-circle' : 'play-circle-outline'}
-              size={27}
-              color={color}
-            />
-          ),
-        }}
-      />
-
-      <Tabs.Screen
-        name="create"
-        options={{
-          title: 'Create',
-          tabBarIcon: () => (
-            <View style={styles.createCircle}>
-              <Ionicons name="add" size={25} color="#ffffff" />
-            </View>
-          ),
-        }}
-      />
-
-      <Tabs.Screen
-        name="connect"
-        options={{
-          title: 'Connect',
-          tabBarIcon: ({ color, focused }) => (
-            <Ionicons
-              name={focused ? 'people' : 'people-outline'}
-              size={26}
-              color={color}
-            />
-          ),
-        }}
-      />
-
-      <Tabs.Screen
-        name="profile"
-        listeners={{
-          tabPress: (e) => {
-            e.preventDefault();
-            openOwnProfile();
-          },
-        }}
-        options={{
-          title: 'Profile',
-          tabBarIcon: ({ color, focused }) =>
-            avatarUrl ? (
-              <View
-                style={[
-                  styles.profileAvatarRing,
-                  focused && styles.profileAvatarRingActive,
-                ]}
-              >
-                <Image
-                  source={{ uri: avatarUrl }}
-                  style={styles.profileAvatarImg}
-                />
-              </View>
-            ) : (
-              <Ionicons
-                name={focused ? 'person' : 'person-outline'}
-                size={26}
-                color={color}
-              />
-            ),
-        }}
-      />
+      <Tabs.Screen name="index" options={{ title: 'Home' }} />
+      <Tabs.Screen name="watch" options={{ title: 'Watch' }} />
+      <Tabs.Screen name="create" options={{ title: 'Create' }} />
+      <Tabs.Screen name="connect" options={{ title: 'Connect' }} />
+      <Tabs.Screen name="profile" options={{ title: 'Profile' }} />
     </Tabs>
   );
 }
 
 const styles = StyleSheet.create({
-  createCircle: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-    backgroundColor: THEME_COLOR,
+  floatingWrapper: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 50,
+  },
+  capsuleDock: {
+    width: '100%',
+    borderTopWidth: 1,
+    paddingHorizontal: 6,
+    paddingTop: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  tabSlot: {
+    flex: 1,
+    height: '100%',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  profileAvatarRing: {
-    width: 35,
-    height: 35,
-    borderRadius: 15,
-    padding: 1.5,
-    borderWidth: 1.0,
-    borderColor: '#cbd5e1',
+  tabInner: {
+    width: 48,
+    height: 44,
+    borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  profileAvatarRingActive: {
-    borderColor: THEME_COLOR,
-    borderWidth: 1,
+  avatarFrame: {
+    width: 27,
+    height: 27,
+    borderRadius: 14,
+    borderWidth: 0,
+    overflow: 'hidden',
   },
-  profileAvatarImg: {
+  avatarPic: {
     width: '100%',
     height: '100%',
-    borderRadius: 14,
+    borderRadius: 999,
     backgroundColor: '#e2e8f0',
   },
 });

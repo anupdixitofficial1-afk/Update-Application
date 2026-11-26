@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   StyleSheet,
   Text,
@@ -12,11 +12,19 @@ import {
   KeyboardAvoidingView,
   Keyboard,
   Platform,
+  DeviceEventEmitter,
+  StatusBar,
+  useColorScheme,
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, Stack } from 'expo-router';
-import { supabase } from '../lib/supabase';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { backend } from '../lib/backend';
+
+const THEME_STORAGE_KEY = 'app_theme_mode_v1';
+const THEME_CHANGED_EVENT = 'app-theme-changed';
+type ThemeMode = 'light' | 'dark' | 'system';
 
 interface CountryCodeItem {
   code: string;
@@ -44,12 +52,9 @@ const getFlagEmoji = (cca2: string): string => {
   const c1 = code.charCodeAt(0);
   const c2 = code.charCodeAt(1);
   if (c1 < 65 || c1 > 90 || c2 < 65 || c2 > 90) return '🌍';
-  const high1 = 0xd83c;
-  const low1 = 0xdde6 + (c1 - 65);
-  const high2 = 0xd83c;
-  const low2 = 0xdde6 + (c2 - 65);
   return (
-    String.fromCharCode(high1, low1) + String.fromCharCode(high2, low2)
+    String.fromCharCode(0xd83c, 0xdde6 + (c1 - 65)) +
+    String.fromCharCode(0xd83c, 0xdde6 + (c2 - 65))
   );
 };
 
@@ -105,18 +110,14 @@ const fetchCountryCodesOnline = async (): Promise<CountryCodeItem[]> => {
     const cleanSuffixes: string[] = [];
     for (let s = 0; s < suffixesRaw.length; s++) {
       const suf = String(suffixesRaw[s] || '').replace(/\s+/g, '');
-      if (suf) {
-        cleanSuffixes.push(suf);
-      }
+      if (suf) cleanSuffixes.push(suf);
     }
 
     let dialCodes: string[] = [];
-
     if (!cleanRoot) {
       dialCodes = [''];
-    } else if (cleanSuffixes.length === 0) {
-      dialCodes = [cleanRoot];
     } else if (
+      cleanSuffixes.length === 0 ||
       cleanRoot === '+1' ||
       cleanRoot === '+7' ||
       cleanSuffixes.length > 12
@@ -125,16 +126,10 @@ const fetchCountryCodesOnline = async (): Promise<CountryCodeItem[]> => {
     } else {
       for (let j = 0; j < cleanSuffixes.length; j++) {
         const suf = cleanSuffixes[j];
-        const combined = suf.startsWith('+')
-          ? suf
-          : `${cleanRoot}${suf}`;
-        if (dialCodes.indexOf(combined) === -1) {
-          dialCodes.push(combined);
-        }
+        const combined = suf.startsWith('+') ? suf : `${cleanRoot}${suf}`;
+        if (dialCodes.indexOf(combined) === -1) dialCodes.push(combined);
       }
-      if (dialCodes.length === 0) {
-        dialCodes = [cleanRoot];
-      }
+      if (dialCodes.length === 0) dialCodes = [cleanRoot];
     }
 
     for (let k = 0; k < dialCodes.length; k++) {
@@ -160,45 +155,84 @@ const fetchCountryCodesOnline = async (): Promise<CountryCodeItem[]> => {
     if (b.cca2 === 'IN' && a.cca2 !== 'IN') return 1;
     if (a.country < b.country) return -1;
     if (a.country > b.country) return 1;
-    if (a.code < b.code) return -1;
-    if (a.code > b.code) return 1;
-    return 0;
+    return a.code.localeCompare(b.code);
   });
 
-  if (parsed.length > 0) {
-    cachedOnlineCountries = parsed;
-  }
-
+  if (parsed.length > 0) cachedOnlineCountries = parsed;
   return parsed;
 };
 
-const sanitizeUsernameOnly = (raw: string): string => {
-  return raw
+const sanitizeUsernameOnly = (raw: string): string =>
+  raw
     .trim()
     .toLowerCase()
     .replace(/^@+/, '')
     .replace(/[^a-z0-9._]/g, '');
-};
 
-const formatHandleUsername = (cleanUsername: string): string => {
-  return cleanUsername ? `@${cleanUsername}` : '';
-};
+const sanitizeMobileDigits = (raw: string): string => raw.replace(/\D/g, '');
 
-const sanitizeMobileDigits = (raw: string): string => {
-  return raw.replace(/\D/g, '');
-};
-
-type ActiveField = 'fullName' | 'username' | 'mobile' | 'email' | 'password' | null;
+type ActiveField =
+  | 'fullName'
+  | 'username'
+  | 'mobile'
+  | 'email'
+  | 'password'
+  | null;
 
 export default function SignUpScreen() {
-  const scrollViewRef = useRef<ScrollView>(null);
+  const scrollViewRef = useRef<React.ComponentRef<typeof ScrollView>>(null);
+  const systemScheme = useColorScheme();
+
+  const [themeMode, setThemeMode] = useState<ThemeMode>('system');
+  const isDark =
+    themeMode === 'dark' || (themeMode === 'system' && systemScheme === 'dark');
+
+  const colors = useMemo(
+    () => ({
+      bg: isDark ? '#09090b' : '#ffffff',
+      surface: isDark ? '#18181b' : '#f4f4f5',
+      card: isDark ? '#18181b' : '#ffffff',
+      border: isDark ? '#27272a' : '#e4e4e7',
+      text: isDark ? '#fafafa' : '#09090b',
+      subtext: isDark ? '#a1a1aa' : '#71717a',
+      accent: isDark ? '#fafafa' : '#09090b',
+      accentText: isDark ? '#09090b' : '#ffffff',
+      emerald: '#10b981',
+      emeraldSoft: isDark ? 'rgba(16, 185, 129, 0.14)' : '#ecfdf5',
+      danger: '#ef4444',
+      dangerSoft: isDark ? 'rgba(239, 68, 68, 0.14)' : '#fef2f2',
+    }),
+    [isDark]
+  );
+
+  useEffect(() => {
+    AsyncStorage.getItem(THEME_STORAGE_KEY)
+      .then((saved) => {
+        if (saved === 'light' || saved === 'dark' || saved === 'system') {
+          setThemeMode(saved);
+        }
+      })
+      .catch(() => {});
+
+    const sub = DeviceEventEmitter.addListener(
+      THEME_CHANGED_EVENT,
+      (mode: ThemeMode) => {
+        if (mode === 'light' || mode === 'dark' || mode === 'system') {
+          setThemeMode(mode);
+        }
+      }
+    );
+    return () => sub.remove();
+  }, []);
 
   const [fullName, setFullName] = useState('');
   const [fullNameError, setFullNameError] = useState<string | null>(null);
 
   const [email, setEmail] = useState('');
   const [emailError, setEmailError] = useState<string | null>(null);
-  const [emailAvailableMsg, setEmailAvailableMsg] = useState<string | null>(null);
+  const [emailAvailableMsg, setEmailAvailableMsg] = useState<string | null>(
+    null
+  );
   const [checkingEmail, setCheckingEmail] = useState(false);
 
   const [password, setPassword] = useState('');
@@ -207,7 +241,9 @@ export default function SignUpScreen() {
 
   const [username, setUsername] = useState('');
   const [usernameError, setUsernameError] = useState<string | null>(null);
-  const [usernameAvailableMsg, setUsernameAvailableMsg] = useState<string | null>(null);
+  const [usernameAvailableMsg, setUsernameAvailableMsg] = useState<
+    string | null
+  >(null);
   const [checkingUsername, setCheckingUsername] = useState(false);
 
   const [countryCodes, setCountryCodes] = useState<CountryCodeItem[]>(
@@ -231,13 +267,9 @@ export default function SignUpScreen() {
   const [activeField, setActiveField] = useState<ActiveField>(null);
 
   const syncCountries = async (forceRefresh = false) => {
-    if (forceRefresh) {
-      cachedOnlineCountries = null;
-    }
-
+    if (forceRefresh) cachedOnlineCountries = null;
     setSyncingCountries(true);
     setCountrySyncError(null);
-
     try {
       const list = await fetchCountryCodesOnline();
       if (list.length > 0) {
@@ -250,47 +282,42 @@ export default function SignUpScreen() {
         }
       }
     } catch (err: any) {
-      setCountrySyncError(err?.message || 'Failed to sync country codes online.');
+      setCountrySyncError(err?.message || 'Failed to sync country codes.');
     } finally {
       setSyncingCountries(false);
     }
   };
 
   useEffect(() => {
-    syncCountries(false);
+    void syncCountries(false);
   }, []);
 
   useEffect(() => {
-    const showSub = Keyboard.addListener('keyboardDidShow', () => {
-      setKeyboardVisible(true);
-    });
-
+    const showSub = Keyboard.addListener('keyboardDidShow', () =>
+      setKeyboardVisible(true)
+    );
     const hideSub = Keyboard.addListener('keyboardDidHide', () => {
       setKeyboardVisible(false);
       setActiveField(null);
-
       requestAnimationFrame(() => {
         scrollViewRef.current?.scrollTo({ y: 0, animated: true });
       });
     });
-
     return () => {
       showSub.remove();
       hideSub.remove();
     };
   }, []);
 
-  // Live debounced username availability check while typing (minimum 6 characters)
+  // Live debounced username availability via backend adapter
   useEffect(() => {
     const clean = sanitizeUsernameOnly(username);
-
     if (!clean) {
       setUsernameAvailableMsg(null);
       setUsernameError(null);
       setCheckingUsername(false);
       return;
     }
-
     if (clean.length < 6) {
       setUsernameAvailableMsg(null);
       setUsernameError('Min 6 chars');
@@ -305,35 +332,24 @@ export default function SignUpScreen() {
     let active = true;
     const timer = setTimeout(async () => {
       try {
-        const { data, error } = await supabase
-          .from('profiles')
-          .select('id')
-          .or(`username.ilike.${clean},username.ilike.@${clean}`)
-          .limit(1);
-
+        const isAvailable = await backend.auth.checkAvailability(
+          'username',
+          clean
+        );
         if (!active) return;
-
-        if (error) {
-          setUsernameAvailableMsg(null);
-          setUsernameError('Check failed');
-          return;
-        }
-
-        if (data && data.length > 0) {
-          setUsernameAvailableMsg(null);
-          setUsernameError('Taken');
-        } else {
+        if (isAvailable) {
           setUsernameError(null);
           setUsernameAvailableMsg('Available');
+        } else {
+          setUsernameAvailableMsg(null);
+          setUsernameError('Taken');
         }
       } catch {
         if (!active) return;
         setUsernameAvailableMsg(null);
         setUsernameError('Check failed');
       } finally {
-        if (active) {
-          setCheckingUsername(false);
-        }
+        if (active) setCheckingUsername(false);
       }
     }, 350);
 
@@ -343,19 +359,12 @@ export default function SignUpScreen() {
     };
   }, [username]);
 
-  // Live debounced email availability check while typing
+  // Live debounced email availability via backend adapter
   useEffect(() => {
     const trimmed = email.trim().toLowerCase();
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-    if (!trimmed) {
-      setEmailAvailableMsg(null);
-      setEmailError(null);
-      setCheckingEmail(false);
-      return;
-    }
-
-    if (!emailRegex.test(trimmed)) {
+    if (!trimmed || !emailRegex.test(trimmed)) {
       setEmailAvailableMsg(null);
       setEmailError(null);
       setCheckingEmail(false);
@@ -369,35 +378,24 @@ export default function SignUpScreen() {
     let active = true;
     const timer = setTimeout(async () => {
       try {
-        const { data, error } = await supabase
-          .from('profiles')
-          .select('id')
-          .ilike('email', trimmed)
-          .limit(1);
-
+        const isAvailable = await backend.auth.checkAvailability(
+          'email',
+          trimmed
+        );
         if (!active) return;
-
-        if (error) {
-          setEmailAvailableMsg(null);
-          setEmailError('Check failed');
-          return;
-        }
-
-        if (data && data.length > 0) {
-          setEmailAvailableMsg(null);
-          setEmailError('Already used');
-        } else {
+        if (isAvailable) {
           setEmailError(null);
           setEmailAvailableMsg('Available');
+        } else {
+          setEmailAvailableMsg(null);
+          setEmailError('Already used');
         }
       } catch {
         if (!active) return;
         setEmailAvailableMsg(null);
         setEmailError('Check failed');
       } finally {
-        if (active) {
-          setCheckingEmail(false);
-        }
+        if (active) setCheckingEmail(false);
       }
     }, 350);
 
@@ -421,24 +419,18 @@ export default function SignUpScreen() {
     country: CountryCodeItem
   ): boolean => {
     const digits = sanitizeMobileDigits(digitsRaw);
-
     if (!digits) {
       setMobileError('Mobile number is required.');
       return false;
     }
-
-    if (
-      digits.length < country.minDigits ||
-      digits.length > country.maxDigits
-    ) {
+    if (digits.length < country.minDigits || digits.length > country.maxDigits) {
       setMobileError(
         country.minDigits === country.maxDigits
-          ? `Enter a valid ${country.minDigits}-digit mobile number for ${country.country}.`
-          : `Enter a valid ${country.minDigits}–${country.maxDigits} digit mobile number.`
+          ? `Enter a valid ${country.minDigits}-digit number for ${country.country}.`
+          : `Enter a valid ${country.minDigits}–${country.maxDigits} digit number.`
       );
       return false;
     }
-
     setMobileError(null);
     return true;
   };
@@ -447,29 +439,20 @@ export default function SignUpScreen() {
     digitsRaw: string,
     country: CountryCodeItem
   ): Promise<boolean> => {
-    const isFormatValid = validateMobile(digitsRaw, country);
-    if (!isFormatValid) return false;
-
+    if (!validateMobile(digitsRaw, country)) return false;
     const digits = sanitizeMobileDigits(digitsRaw);
     const fullPhone = `${country.code}${digits}`;
 
     setCheckingMobile(true);
     try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('id')
-        .or(`phone.eq.${fullPhone},mobile_number.eq.${digits}`)
-        .limit(1);
-
-      if (error) {
-        return true;
-      }
-
-      if (data && data.length > 0) {
+      const isAvailable = await backend.auth.checkAvailability(
+        'phone',
+        fullPhone
+      );
+      if (!isAvailable) {
         setMobileError('This mobile number is already registered.');
         return false;
       }
-
       setMobileError(null);
       return true;
     } catch {
@@ -479,9 +462,7 @@ export default function SignUpScreen() {
     }
   };
 
-  const checkUsernameAvailability = async (
-    rawValue: string
-  ): Promise<boolean> => {
+  const checkUsernameAvailability = async (rawValue: string): Promise<boolean> => {
     const clean = sanitizeUsernameOnly(rawValue);
     setUsername(clean);
 
@@ -490,7 +471,6 @@ export default function SignUpScreen() {
       setUsernameError('Required');
       return false;
     }
-
     if (clean.length < 6) {
       setUsernameAvailableMsg(null);
       setUsernameError('Min 6 chars');
@@ -498,26 +478,16 @@ export default function SignUpScreen() {
     }
 
     setCheckingUsername(true);
-
     try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('id')
-        .or(`username.ilike.${clean},username.ilike.@${clean}`)
-        .limit(1);
-
-      if (error) {
-        setUsernameAvailableMsg(null);
-        setUsernameError('Check failed');
-        return false;
-      }
-
-      if (data && data.length > 0) {
+      const isAvailable = await backend.auth.checkAvailability(
+        'username',
+        clean
+      );
+      if (!isAvailable) {
         setUsernameAvailableMsg(null);
         setUsernameError('Taken');
         return false;
       }
-
       setUsernameError(null);
       setUsernameAvailableMsg('Available');
       return true;
@@ -530,12 +500,9 @@ export default function SignUpScreen() {
     }
   };
 
-  const checkEmailAvailability = async (
-    rawEmail: string
-  ): Promise<boolean> => {
+  const checkEmailAvailability = async (rawEmail: string): Promise<boolean> => {
     const trimmed = rawEmail.trim().toLowerCase();
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
     if (!emailRegex.test(trimmed)) {
       setEmailAvailableMsg(null);
       setEmailError('Invalid email');
@@ -543,26 +510,13 @@ export default function SignUpScreen() {
     }
 
     setCheckingEmail(true);
-
     try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('id')
-        .ilike('email', trimmed)
-        .limit(1);
-
-      if (error) {
-        setEmailAvailableMsg(null);
-        setEmailError('Check failed');
-        return false;
-      }
-
-      if (data && data.length > 0) {
+      const isAvailable = await backend.auth.checkAvailability('email', trimmed);
+      if (!isAvailable) {
         setEmailAvailableMsg(null);
         setEmailError('Already used');
         return false;
       }
-
       setEmailError(null);
       setEmailAvailableMsg('Available');
       return true;
@@ -577,137 +531,65 @@ export default function SignUpScreen() {
 
   const handleSignUp = async () => {
     if (submitting) return;
-
     Keyboard.dismiss();
     setFormError(null);
 
     const trimmedName = fullName.trim();
     const trimmedEmail = email.trim().toLowerCase();
     const cleanUser = sanitizeUsernameOnly(username);
-    const formattedHandle = formatHandleUsername(cleanUser);
     const cleanDigits = sanitizeMobileDigits(mobileNumber);
 
     let hasClientError = false;
-
     if (!trimmedName) {
       setFullNameError('Full name is required.');
       hasClientError = true;
     } else {
       setFullNameError(null);
     }
-
     if (!password || password.length < 6) {
       setPasswordError('Password must be at least 6 characters.');
       hasClientError = true;
     } else {
       setPasswordError(null);
     }
-
-    const isPhoneFormatValid = validateMobile(cleanDigits, selectedCountry);
-    if (!isPhoneFormatValid) {
+    if (!validateMobile(cleanDigits, selectedCountry)) {
       hasClientError = true;
     }
-
     if (hasClientError) return;
 
     setSubmitting(true);
-
     try {
-      const isUserValid = await checkUsernameAvailability(cleanUser);
-      if (!isUserValid) return;
+      if (!(await checkUsernameAvailability(cleanUser))) return;
+      if (!(await checkEmailAvailability(trimmedEmail))) return;
+      if (!(await checkMobileAvailability(cleanDigits, selectedCountry))) return;
 
-      const isEmailValid = await checkEmailAvailability(trimmedEmail);
-      if (!isEmailValid) return;
-
-      const isMobileAvailable = await checkMobileAvailability(
-        cleanDigits,
-        selectedCountry
-      );
-      if (!isMobileAvailable) return;
-
-      const fullPhone = `${selectedCountry.code}${cleanDigits}`;
-
-      const { data, error } = await supabase.auth.signUp({
+      await backend.auth.signUp({
+        fullName: trimmedName,
+        username: cleanUser,
         email: trimmedEmail,
         password,
-        options: {
-          data: {
-            full_name: trimmedName,
-            username: formattedHandle,
-            email: trimmedEmail,
-            country_code: selectedCountry.code,
-            mobile_number: cleanDigits,
-            phone: fullPhone,
-          },
-        },
+        countryCode: selectedCountry.code,
+        mobileNumber: cleanDigits,
       });
-
-      if (error) {
-        const msg = error.message.toLowerCase();
-
-        if (
-          msg.includes('already registered') ||
-          msg.includes('already exists') ||
-          msg.includes('email')
-        ) {
-          setEmailAvailableMsg(null);
-          setEmailError('Already used');
-          return;
-        }
-
-        if (msg.includes('username') || msg.includes('duplicate')) {
-          setUsernameAvailableMsg(null);
-          setUsernameError('Taken');
-          return;
-        }
-
-        if (msg.includes('phone') || msg.includes('mobile')) {
-          setMobileError('This mobile number is already registered.');
-          return;
-        }
-
-        setFormError(error.message);
-        return;
-      }
-
-      if (!data.user) {
-        setFormError('Account creation failed. Please try again.');
-        return;
-      }
-
-      if (data.session) {
-        const { error: profileError } = await supabase
-          .from('profiles')
-          .upsert(
-            {
-              id: data.user.id,
-              full_name: trimmedName,
-              username: formattedHandle,
-              email: trimmedEmail,
-              country_code: selectedCountry.code,
-              mobile_number: cleanDigits,
-              phone: fullPhone,
-            },
-            { onConflict: 'id' }
-          );
-
-        if (profileError) {
-          const pMsg = profileError.message.toLowerCase();
-          if (pMsg.includes('username')) {
-            setUsernameAvailableMsg(null);
-            setUsernameError('Taken');
-            return;
-          }
-          setFormError(profileError.message);
-          return;
-        }
-      }
 
       router.replace('/login');
     } catch (error: any) {
-      setFormError(
-        error?.message || 'Something went wrong. Please try again.'
-      );
+      const msg = String(error?.message || '').toLowerCase();
+      if (
+        msg.includes('already registered') ||
+        msg.includes('already exists') ||
+        msg.includes('email')
+      ) {
+        setEmailAvailableMsg(null);
+        setEmailError('Already used');
+      } else if (msg.includes('username') || msg.includes('duplicate')) {
+        setUsernameAvailableMsg(null);
+        setUsernameError('Taken');
+      } else if (msg.includes('phone') || msg.includes('mobile')) {
+        setMobileError('This mobile number is already registered.');
+      } else {
+        setFormError(error?.message || 'Something went wrong. Please try again.');
+      }
     } finally {
       setSubmitting(false);
     }
@@ -718,28 +600,27 @@ export default function SignUpScreen() {
     availableMsg: string | null,
     errorMsg: string | null
   ) => {
-    if (checking) {
-      return <ActivityIndicator size="small" color="#10b981" />;
-    }
-
+    if (checking) return <ActivityIndicator size="small" color={colors.emerald} />;
     if (availableMsg) {
       return (
         <View style={styles.statusInlineRow}>
-          <Ionicons name="checkmark-circle" size={15} color="#10b981" />
-          <Text style={styles.inlineAvailableText}>{availableMsg}</Text>
+          <Ionicons name="checkmark-circle" size={15} color={colors.emerald} />
+          <Text style={[styles.inlineAvailableText, { color: colors.emerald }]}>
+            {availableMsg}
+          </Text>
         </View>
       );
     }
-
     if (errorMsg) {
       return (
         <View style={styles.statusInlineRow}>
-          <Ionicons name="close-circle" size={15} color="#ef4444" />
-          <Text style={styles.inlineErrorText}>{errorMsg}</Text>
+          <Ionicons name="close-circle" size={15} color={colors.danger} />
+          <Text style={[styles.inlineErrorText, { color: colors.danger }]}>
+            {errorMsg}
+          </Text>
         </View>
       );
     }
-
     return null;
   };
 
@@ -755,11 +636,16 @@ export default function SignUpScreen() {
     );
   });
 
-  const shouldAvoidKeyboard = activeField === 'email' || activeField === 'password';
+  const shouldAvoidKeyboard =
+    activeField === 'email' || activeField === 'password';
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView
+      style={[styles.container, { backgroundColor: colors.bg }]}
+      edges={['top', 'bottom']}
+    >
       <Stack.Screen options={{ headerShown: false }} />
+      <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
 
       <KeyboardAvoidingView
         enabled={shouldAvoidKeyboard}
@@ -777,37 +663,41 @@ export default function SignUpScreen() {
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          {/* LOGO ICON BOX */}
-          <View
-            style={[
-              styles.logoContainer,
-              keyboardVisible && shouldAvoidKeyboard && styles.logoContainerCompact,
-            ]}
-          >
-            <View style={styles.flameIconBox}>
-              <MaterialCommunityIcons name="fire" size={32} color="#0f172a" />
+          <View style={styles.logoContainer}>
+            <View
+              style={[
+                styles.flameIconBox,
+                { backgroundColor: colors.surface, borderColor: colors.border },
+              ]}
+            >
+              <MaterialCommunityIcons
+                name="fire"
+                size={30}
+                color={colors.emerald}
+              />
             </View>
           </View>
 
-          {/* APP TITLE & TAGLINE */}
-          <Text style={styles.appTitle}>VibeSphere</Text>
-          <Text
-            style={[
-              styles.appSubtitle,
-              keyboardVisible && shouldAvoidKeyboard && styles.appSubtitleCompact,
-            ]}
-          >
-            Instagram, YouTube & Facebook united with{'\n'}Dual Identity & Smart Video Mode.
+          <Text style={[styles.appTitle, { color: colors.text }]}>
+            Create Account
+          </Text>
+          <Text style={[styles.appSubtitle, { color: colors.subtext }]}>
+            Join VibeSphere with your profile, handle & mobile number
           </Text>
 
-          {/* FORM FIELDS CONTAINER */}
           <View style={styles.formContainer}>
             {/* FULL NAME */}
             <View style={styles.inputWrapper}>
               <TextInput
                 style={[
                   styles.textInput,
-                  fullNameError ? styles.inputError : null,
+                  {
+                    backgroundColor: fullNameError
+                      ? colors.dangerSoft
+                      : colors.surface,
+                    borderColor: fullNameError ? colors.danger : colors.border,
+                    color: colors.text,
+                  },
                 ]}
                 value={fullName}
                 onChangeText={(text) => {
@@ -816,11 +706,13 @@ export default function SignUpScreen() {
                 }}
                 onFocus={() => handleFocusField('fullName', false)}
                 placeholder="Enter your full name"
-                placeholderTextColor="#94a3b8"
+                placeholderTextColor={colors.subtext}
                 autoCapitalize="words"
               />
               {fullNameError ? (
-                <Text style={styles.errorText}>{fullNameError}</Text>
+                <Text style={[styles.errorText, { color: colors.danger }]}>
+                  {fullNameError}
+                </Text>
               ) : null}
             </View>
 
@@ -829,12 +721,20 @@ export default function SignUpScreen() {
               <View
                 style={[
                   styles.inlineInputBox,
-                  usernameError ? styles.inputError : null,
-                  usernameAvailableMsg ? styles.inputAvailable : null,
+                  {
+                    backgroundColor: usernameError
+                      ? colors.dangerSoft
+                      : colors.surface,
+                    borderColor: usernameError
+                      ? colors.danger
+                      : usernameAvailableMsg
+                        ? colors.emerald
+                        : colors.border,
+                  },
                 ]}
               >
                 <TextInput
-                  style={styles.inlineTextInput}
+                  style={[styles.inlineTextInput, { color: colors.text }]}
                   value={username}
                   onChangeText={(text) => {
                     setUsername(sanitizeUsernameOnly(text));
@@ -842,12 +742,10 @@ export default function SignUpScreen() {
                   }}
                   onFocus={() => handleFocusField('username', false)}
                   onBlur={() => {
-                    if (username.trim()) {
-                      checkUsernameAvailability(username);
-                    }
+                    if (username.trim()) void checkUsernameAvailability(username);
                   }}
-                  placeholder="Enter username (min 6 chars)"
-                  placeholderTextColor="#94a3b8"
+                  placeholder="Username (min 6 chars)"
+                  placeholderTextColor={colors.subtext}
                   autoCapitalize="none"
                   autoCorrect={false}
                 />
@@ -865,58 +763,65 @@ export default function SignUpScreen() {
                 <TouchableOpacity
                   style={[
                     styles.codeBox,
-                    mobileError ? styles.inputError : null,
+                    {
+                      backgroundColor: colors.surface,
+                      borderColor: mobileError ? colors.danger : colors.border,
+                    },
                   ]}
                   onPress={() => {
                     setCountryModalOpen(true);
                     if (countryCodes.length <= 1 && !syncingCountries) {
-                      syncCountries(false);
+                      void syncCountries(false);
                     }
                   }}
                   activeOpacity={0.8}
                 >
                   <Text style={styles.codeFlag}>{selectedCountry.flag}</Text>
-                  <Text style={styles.codeText}>{selectedCountry.code}</Text>
-                  {syncingCountries ? (
-                    <ActivityIndicator size="small" color="#10b981" />
-                  ) : (
-                    <Ionicons name="chevron-down" size={14} color="#475569" />
-                  )}
+                  <Text style={[styles.codeText, { color: colors.text }]}>
+                    {selectedCountry.code}
+                  </Text>
+                  <Ionicons name="chevron-down" size={14} color={colors.subtext} />
                 </TouchableOpacity>
 
                 <View
                   style={[
                     styles.inlineInputBox,
-                    { flex: 1 },
-                    mobileError ? styles.inputError : null,
+                    {
+                      flex: 1,
+                      backgroundColor: mobileError
+                        ? colors.dangerSoft
+                        : colors.surface,
+                      borderColor: mobileError ? colors.danger : colors.border,
+                    },
                   ]}
                 >
                   <TextInput
-                    style={styles.inlineTextInput}
+                    style={[styles.inlineTextInput, { color: colors.text }]}
                     value={mobileNumber}
                     onChangeText={(text) => {
-                      const digits = sanitizeMobileDigits(text);
-                      setMobileNumber(digits);
+                      setMobileNumber(sanitizeMobileDigits(text));
                       if (mobileError) setMobileError(null);
                     }}
                     onFocus={() => handleFocusField('mobile', false)}
                     onBlur={() => {
                       if (mobileNumber.trim()) {
-                        checkMobileAvailability(mobileNumber, selectedCountry);
+                        void checkMobileAvailability(mobileNumber, selectedCountry);
                       }
                     }}
-                    placeholder="Enter mobile number"
-                    placeholderTextColor="#94a3b8"
+                    placeholder="Mobile number"
+                    placeholderTextColor={colors.subtext}
                     keyboardType="phone-pad"
                     maxLength={selectedCountry.maxDigits}
                   />
                   {checkingMobile && (
-                    <ActivityIndicator size="small" color="#10b981" />
+                    <ActivityIndicator size="small" color={colors.emerald} />
                   )}
                 </View>
               </View>
               {mobileError ? (
-                <Text style={styles.errorText}>{mobileError}</Text>
+                <Text style={[styles.errorText, { color: colors.danger }]}>
+                  {mobileError}
+                </Text>
               ) : null}
             </View>
 
@@ -925,12 +830,20 @@ export default function SignUpScreen() {
               <View
                 style={[
                   styles.inlineInputBox,
-                  emailError ? styles.inputError : null,
-                  emailAvailableMsg ? styles.inputAvailable : null,
+                  {
+                    backgroundColor: emailError
+                      ? colors.dangerSoft
+                      : colors.surface,
+                    borderColor: emailError
+                      ? colors.danger
+                      : emailAvailableMsg
+                        ? colors.emerald
+                        : colors.border,
+                  },
                 ]}
               >
                 <TextInput
-                  style={styles.inlineTextInput}
+                  style={[styles.inlineTextInput, { color: colors.text }]}
                   value={email}
                   onChangeText={(text) => {
                     setEmail(text);
@@ -938,12 +851,10 @@ export default function SignUpScreen() {
                   }}
                   onFocus={() => handleFocusField('email', true)}
                   onBlur={() => {
-                    if (email.trim()) {
-                      checkEmailAvailability(email);
-                    }
+                    if (email.trim()) void checkEmailAvailability(email);
                   }}
-                  placeholder="Enter your email"
-                  placeholderTextColor="#94a3b8"
+                  placeholder="Email address"
+                  placeholderTextColor={colors.subtext}
                   keyboardType="email-address"
                   autoCapitalize="none"
                   autoCorrect={false}
@@ -961,11 +872,16 @@ export default function SignUpScreen() {
               <View
                 style={[
                   styles.inlineInputBox,
-                  passwordError ? styles.inputError : null,
+                  {
+                    backgroundColor: passwordError
+                      ? colors.dangerSoft
+                      : colors.surface,
+                    borderColor: passwordError ? colors.danger : colors.border,
+                  },
                 ]}
               >
                 <TextInput
-                  style={styles.inlineTextInput}
+                  style={[styles.inlineTextInput, { color: colors.text }]}
                   value={password}
                   onChangeText={(text) => {
                     setPassword(text);
@@ -973,53 +889,58 @@ export default function SignUpScreen() {
                   }}
                   onFocus={() => handleFocusField('password', true)}
                   secureTextEntry={!showPassword}
-                  placeholder="Enter password (min 6 characters)"
-                  placeholderTextColor="#94a3b8"
+                  placeholder="Password (min 6 characters)"
+                  placeholderTextColor={colors.subtext}
                   autoCapitalize="none"
                 />
-                <TouchableOpacity onPress={() => setShowPassword((prev) => !prev)}>
+                <TouchableOpacity onPress={() => setShowPassword((p) => !p)}>
                   <Ionicons
                     name={showPassword ? 'eye-off-outline' : 'eye-outline'}
                     size={18}
-                    color="#64748b"
+                    color={colors.subtext}
                   />
                 </TouchableOpacity>
               </View>
               {passwordError ? (
-                <Text style={styles.errorText}>{passwordError}</Text>
+                <Text style={[styles.errorText, { color: colors.danger }]}>
+                  {passwordError}
+                </Text>
               ) : null}
             </View>
 
             {formError ? (
-              <Text style={styles.errorText}>{formError}</Text>
+              <Text style={[styles.errorText, { color: colors.danger }]}>
+                {formError}
+              </Text>
             ) : null}
 
-            {/* CREATE ACCOUNT BUTTON */}
             <TouchableOpacity
-              style={[styles.signUpBtn, submitting && { opacity: 0.7 }]}
-              onPress={handleSignUp}
+              style={[
+                styles.signUpBtn,
+                { backgroundColor: colors.accent },
+                submitting && { opacity: 0.7 },
+              ]}
+              onPress={() => void handleSignUp()}
               activeOpacity={0.85}
               disabled={submitting}
             >
               {submitting ? (
-                <ActivityIndicator color="#ffffff" />
+                <ActivityIndicator color={colors.accentText} />
               ) : (
-                <Text style={styles.signUpBtnText}>Create Account</Text>
+                <Text
+                  style={[styles.signUpBtnText, { color: colors.accentText }]}
+                >
+                  Create Account
+                </Text>
               )}
             </TouchableOpacity>
           </View>
 
-          {/* FOOTER LOG IN LINK */}
-          <View
-            style={[
-              styles.footerContainer,
-              keyboardVisible && shouldAvoidKeyboard && styles.footerContainerCompact,
-            ]}
-          >
-            <Text style={styles.footerText}>
+          <View style={styles.footerContainer}>
+            <Text style={[styles.footerText, { color: colors.subtext }]}>
               Already have an account?{' '}
               <Text
-                style={styles.loginLinkText}
+                style={[styles.loginLinkText, { color: colors.text }]}
                 onPress={() => router.replace('/login')}
               >
                 Log In
@@ -1027,7 +948,7 @@ export default function SignUpScreen() {
             </Text>
           </View>
 
-          {/* COUNTRY CODE SELECTOR MODAL */}
+          {/* COUNTRY CODE MODAL */}
           <Modal
             visible={countryModalOpen}
             transparent
@@ -1035,47 +956,62 @@ export default function SignUpScreen() {
             onRequestClose={() => setCountryModalOpen(false)}
           >
             <View style={styles.modalBackdrop}>
-              <View style={styles.modalSheet}>
+              <View style={[styles.modalSheet, { backgroundColor: colors.card }]}>
                 <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Select Country Code</Text>
+                  <Text style={[styles.modalTitle, { color: colors.text }]}>
+                    Select Country Code
+                  </Text>
                   <View style={styles.modalHeaderActions}>
                     <TouchableOpacity
-                      onPress={() => syncCountries(true)}
+                      onPress={() => void syncCountries(true)}
                       disabled={syncingCountries}
-                      style={styles.refreshBtn}
                     >
                       <Ionicons
                         name="refresh"
                         size={18}
-                        color={syncingCountries ? '#94a3b8' : '#10b981'}
+                        color={syncingCountries ? colors.subtext : colors.emerald}
                       />
                     </TouchableOpacity>
                     <TouchableOpacity onPress={() => setCountryModalOpen(false)}>
-                      <Ionicons name="close" size={22} color="#0f172a" />
+                      <Ionicons name="close" size={22} color={colors.text} />
                     </TouchableOpacity>
                   </View>
                 </View>
 
                 <TextInput
-                  style={[styles.textInput, { marginBottom: 10 }]}
+                  style={[
+                    styles.textInput,
+                    {
+                      backgroundColor: colors.surface,
+                      borderColor: colors.border,
+                      color: colors.text,
+                      marginBottom: 10,
+                    },
+                  ]}
                   value={countrySearch}
                   onChangeText={setCountrySearch}
                   placeholder="Search country or +91..."
-                  placeholderTextColor="#94a3b8"
+                  placeholderTextColor={colors.subtext}
                 />
 
                 {syncingCountries ? (
                   <View style={styles.syncStatusBox}>
-                    <ActivityIndicator size="small" color="#10b981" />
-                    <Text style={styles.syncStatusText}>
-                      Syncing country codes online...
+                    <ActivityIndicator size="small" color={colors.emerald} />
+                    <Text
+                      style={[styles.syncStatusText, { color: colors.subtext }]}
+                    >
+                      Syncing country codes...
                     </Text>
                   </View>
                 ) : countrySyncError ? (
                   <View style={styles.syncStatusBox}>
-                    <Text style={styles.errorText}>{countrySyncError}</Text>
-                    <TouchableOpacity onPress={() => syncCountries(true)}>
-                      <Text style={styles.retryText}>Retry Sync</Text>
+                    <Text style={[styles.errorText, { color: colors.danger }]}>
+                      {countrySyncError}
+                    </Text>
+                    <TouchableOpacity onPress={() => void syncCountries(true)}>
+                      <Text style={{ color: colors.emerald, fontWeight: '700' }}>
+                        Retry
+                      </Text>
                     </TouchableOpacity>
                   </View>
                 ) : (
@@ -1094,25 +1030,28 @@ export default function SignUpScreen() {
                         <TouchableOpacity
                           style={[
                             styles.countryItem,
-                            isSelected && styles.countryItemSelected,
+                            { borderBottomColor: colors.border },
+                            isSelected && { backgroundColor: colors.emeraldSoft },
                           ]}
                           onPress={() => {
                             setSelectedCountry(item);
                             setCountryModalOpen(false);
                             setCountrySearch('');
                             if (mobileNumber.trim()) {
-                              checkMobileAvailability(mobileNumber, item);
+                              void checkMobileAvailability(mobileNumber, item);
                             }
                           }}
                         >
-                          <Text style={styles.countryItemText}>
+                          <Text
+                            style={[styles.countryItemText, { color: colors.text }]}
+                          >
                             {item.flag} {item.country} ({item.code || 'N/A'})
                           </Text>
                           {isSelected && (
                             <Ionicons
                               name="checkmark"
                               size={18}
-                              color="#10b981"
+                              color={colors.emerald}
                             />
                           )}
                         </TouchableOpacity>
@@ -1130,184 +1069,69 @@ export default function SignUpScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f8fafc',
-  },
-  scrollContainer: {
-    flexGrow: 1,
-    paddingHorizontal: 24,
-    paddingVertical: 18,
-  },
-  scrollContainerCentered: {
-    justifyContent: 'center',
-  },
-  scrollContainerKeyboardOpen: {
-    justifyContent: 'flex-start',
-    paddingTop: 12,
-  },
-  logoContainer: {
-    alignItems: 'center',
-    marginBottom: 14,
-  },
-  logoContainerCompact: {
-    marginBottom: 8,
-  },
+  container: { flex: 1 },
+  scrollContainer: { flexGrow: 1, paddingHorizontal: 24, paddingVertical: 18 },
+  scrollContainerCentered: { justifyContent: 'center' },
+  scrollContainerKeyboardOpen: { justifyContent: 'flex-start', paddingTop: 12 },
+  logoContainer: { alignItems: 'center', marginBottom: 12 },
   flameIconBox: {
     width: 64,
     height: 64,
     borderRadius: 20,
-    backgroundColor: '#ffffff',
+    borderWidth: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-    shadowColor: '#0f172a',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.06,
-    shadowRadius: 10,
-    elevation: 2,
   },
-  appTitle: {
-    fontSize: 26,
-    fontWeight: '800',
-    color: '#0f172a',
-    textAlign: 'center',
-    letterSpacing: -0.4,
-  },
-  appSubtitle: {
-    fontSize: 13,
-    lineHeight: 19,
-    color: '#64748b',
-    textAlign: 'center',
-    marginTop: 6,
-    marginBottom: 20,
-  },
-  appSubtitleCompact: {
-    marginBottom: 12,
-  },
-  formContainer: {
-    width: '100%',
-  },
-  inputWrapper: {
-    marginBottom: 12,
-  },
+  appTitle: { fontSize: 25, fontWeight: '800', textAlign: 'center' },
+  appSubtitle: { fontSize: 13, textAlign: 'center', marginTop: 4, marginBottom: 20 },
+  formContainer: { width: '100%' },
+  inputWrapper: { marginBottom: 12 },
   textInput: {
-    backgroundColor: '#ffffff',
     borderWidth: 1,
-    borderColor: '#cbd5e1',
     borderRadius: 12,
     paddingHorizontal: 14,
     paddingVertical: 12,
     fontSize: 14,
-    color: '#0f172a',
   },
   inlineInputBox: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#ffffff',
     borderWidth: 1,
-    borderColor: '#cbd5e1',
     borderRadius: 12,
     paddingHorizontal: 14,
     minHeight: 48,
   },
-  inlineTextInput: {
-    flex: 1,
-    paddingVertical: 11,
-    fontSize: 14,
-    color: '#0f172a',
-  },
-  inputError: {
-    borderColor: '#ef4444',
-    backgroundColor: '#fef2f2',
-  },
-  inputAvailable: {
-    borderColor: '#10b981',
-  },
-  statusInlineRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    marginLeft: 8,
-  },
-  inlineAvailableText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#10b981',
-  },
-  inlineErrorText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#ef4444',
-  },
-  errorText: {
-    fontSize: 12,
-    color: '#ef4444',
-    fontWeight: '600',
-    marginTop: 4,
-  },
-  phoneRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
+  inlineTextInput: { flex: 1, paddingVertical: 11, fontSize: 14 },
+  statusInlineRow: { flexDirection: 'row', alignItems: 'center', gap: 4, marginLeft: 8 },
+  inlineAvailableText: { fontSize: 12, fontWeight: '700' },
+  inlineErrorText: { fontSize: 12, fontWeight: '700' },
+  errorText: { fontSize: 12, fontWeight: '600', marginTop: 4 },
+  phoneRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   codeBox: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
-    backgroundColor: '#ffffff',
     borderWidth: 1,
-    borderColor: '#cbd5e1',
     borderRadius: 12,
     paddingHorizontal: 10,
     minHeight: 48,
   },
-  codeFlag: {
-    fontSize: 16,
-  },
-  codeText: {
-    fontSize: 13.5,
-    fontWeight: '700',
-    color: '#0f172a',
-  },
-  signUpBtn: {
-    backgroundColor: '#10b981',
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: 'center',
-    marginTop: 6,
-  },
-  signUpBtnText: {
-    color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  footerContainer: {
-    alignItems: 'center',
-    marginTop: 18,
-  },
-  footerContainerCompact: {
-    marginTop: 12,
-  },
-  footerText: {
-    fontSize: 13.5,
-    color: '#64748b',
-  },
-  loginLinkText: {
-    color: '#10b981',
-    fontWeight: '700',
-  },
+  codeFlag: { fontSize: 16 },
+  codeText: { fontSize: 13.5, fontWeight: '700' },
+  signUpBtn: { borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: 6 },
+  signUpBtnText: { fontSize: 15, fontWeight: '800' },
+  footerContainer: { alignItems: 'center', marginTop: 20 },
+  footerText: { fontSize: 13 },
+  loginLinkText: { fontWeight: '800' },
   modalBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(15, 23, 42, 0.45)',
+    backgroundColor: 'rgba(9, 9, 11, 0.52)',
     justifyContent: 'flex-end',
   },
   modalSheet: {
-    backgroundColor: '#ffffff',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    padding: 16,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 18,
     maxHeight: '75%',
   },
   modalHeader: {
@@ -1316,19 +1140,8 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 12,
   },
-  modalTitle: {
-    fontSize: 16,
-    fontWeight: '800',
-    color: '#0f172a',
-  },
-  modalHeaderActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  refreshBtn: {
-    padding: 4,
-  },
+  modalTitle: { fontSize: 17, fontWeight: '800' },
+  modalHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 14 },
   syncStatusBox: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1336,33 +1149,14 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingVertical: 20,
   },
-  syncStatusText: {
-    fontSize: 13,
-    color: '#64748b',
-    fontWeight: '600',
-  },
-  retryText: {
-    fontSize: 13,
-    color: '#10b981',
-    fontWeight: '700',
-    marginLeft: 8,
-  },
+  syncStatusText: { fontSize: 13, fontWeight: '600' },
   countryItem: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 11,
+    paddingVertical: 12,
     paddingHorizontal: 10,
     borderBottomWidth: 1,
-    borderBottomColor: '#f1f5f9',
   },
-  countryItemSelected: {
-    backgroundColor: '#ecfdf5',
-    borderRadius: 8,
-  },
-  countryItemText: {
-    fontSize: 13.5,
-    color: '#0f172a',
-    fontWeight: '500',
-  },
+  countryItemText: { fontSize: 13.5, fontWeight: '600' },
 });

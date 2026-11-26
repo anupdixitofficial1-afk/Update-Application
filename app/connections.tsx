@@ -15,7 +15,7 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useLocalSearchParams, useNavigation, Stack } from 'expo-router';
-import { supabase } from '../lib/supabase';
+import { backend } from '../lib/backend';
 
 const FOLLOWS_UPDATED_EVENT = 'follows-updated';
 
@@ -121,135 +121,23 @@ export default function ConnectionsScreen() {
   const [analysisUser, setAnalysisUser] = useState<ConnectionUser | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const fetchSubscriptionMeta = async (
-    profileId: string
-  ): Promise<{ ids: string[]; metaById: Record<string, any> }> => {
-    try {
-      const { data, error } = await supabase
-        .from('subscriptions')
-        .select('*')
-        .or(`subscriber_id.eq.${profileId},user_id.eq.${profileId}`);
-
-      if (error) return { ids: [], metaById: {} };
-
-      const activeRows = (data || []).filter((row: any) => {
-        const st = String(row?.status || 'active').toLowerCase();
-        return st === 'active' || st === 'subscribed' || st === 'accepted';
-      });
-
-      const ids: string[] = [];
-      const metaById: Record<string, any> = {};
-
-      for (const row of activeRows) {
-        const targetId = row.creator_id || row.channel_id || row.target_id;
-        if (targetId && targetId !== profileId) {
-          if (!metaById[targetId]) {
-            ids.push(targetId);
-            metaById[targetId] = row;
-          }
-        }
-      }
-
-      return { ids, metaById };
-    } catch {
-      return { ids: [], metaById: {} };
-    }
-  };
-
-  const fetchProfilesByIds = async (
-    ids: string[],
-    metaById: Record<string, any> = {}
-  ): Promise<ConnectionUser[]> => {
-    if (!ids.length) return [];
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('id, full_name, username, avatar_url, bio')
-      .in('id', ids);
-
-    if (error) throw error;
-
-    const map = new Map((data || []).map((p: any) => [p.id, p]));
-    return ids
-      .map((id) => {
-        const p = map.get(id);
-        if (!p) return null;
-        const subMeta = metaById[id] || {};
-        return {
-          ...p,
-          plan_name: subMeta.plan_name || subMeta.tier || 'Active Plan',
-          status: subMeta.status || 'active',
-          expires_at: subMeta.expires_at || subMeta.ends_at || null,
-          created_at: subMeta.created_at || null,
-        } as ConnectionUser;
-      })
-      .filter(Boolean) as ConnectionUser[];
-  };
-
   const loadCountsAndTabData = useCallback(
     async (profileId: string, tab: ConnectionTab, currentAuthId: string | null) => {
       setLoading(true);
       setUsersList([]);
 
       try {
-        const [followersRes, followingRes, subData, myFollowingRes] =
-          await Promise.all([
-            supabase
-              .from('follows')
-              .select('follower_id')
-              .eq('following_id', profileId)
-              .or('status.eq.accepted,status.is.null'),
-            supabase
-              .from('follows')
-              .select('following_id')
-              .eq('follower_id', profileId)
-              .or('status.eq.accepted,status.is.null'),
-            fetchSubscriptionMeta(profileId),
-            currentAuthId
-              ? supabase
-                  .from('follows')
-                  .select('following_id')
-                  .eq('follower_id', currentAuthId)
-                  .or('status.eq.accepted,status.is.null')
-              : Promise.resolve({ data: [] as any[] }),
-          ]);
-
-        const followerIds = Array.from(
-          new Set(
-            (followersRes.data || []).map((r: any) => r.follower_id).filter(Boolean)
-          )
-        );
-        const followingIds = Array.from(
-          new Set(
-            (followingRes.data || [])
-              .map((r: any) => r.following_id)
-              .filter(Boolean)
-          )
-        );
-        const myFollowIds = Array.from(
-          new Set(
-            ((myFollowingRes as any)?.data || [])
-              .map((r: any) => r.following_id)
-              .filter(Boolean)
-          )
+        const res = await backend.connect.getConnectionsTabData(
+          profileId,
+          tab,
+          currentAuthId
         );
 
-        setMyFollowingIds(myFollowIds);
-        setFollowersCount(followerIds.length);
-        setFollowingCount(followingIds.length);
-        setSubscriptionsCount(subData.ids.length);
-
-        const targetIds =
-          tab === 'followers'
-            ? followerIds
-            : tab === 'following'
-              ? followingIds
-              : subData.ids;
-
-        const profiles = await fetchProfilesByIds(
-          targetIds,
-          tab === 'subscriptions' ? subData.metaById : {}
-        );
-        setUsersList(profiles);
+        setMyFollowingIds(res.myFollowingIds);
+        setFollowersCount(res.followersCount);
+        setFollowingCount(res.followingCount);
+        setSubscriptionsCount(res.subscriptionsCount);
+        setUsersList(res.users);
       } catch (err) {
         console.error('Error loading connections:', err);
         setUsersList([]);
@@ -264,11 +152,8 @@ export default function ConnectionsScreen() {
     let mounted = true;
 
     const init = async () => {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-
-      const authId = session?.user?.id ?? null;
+      const currentUser = await backend.auth.getCurrentUser().catch(() => null);
+      const authId = currentUser?.id ?? null;
       const paramId =
         typeof params?.userId === 'string' && params.userId.trim()
           ? params.userId.trim()
@@ -282,11 +167,9 @@ export default function ConnectionsScreen() {
       if (params?.title) {
         setUserNameDisplay(params.title);
       } else if (effectiveId) {
-        const { data: prof } = await supabase
-          .from('profiles')
-          .select('full_name, username')
-          .eq('id', effectiveId)
-          .maybeSingle();
+        const prof = await backend.profile
+          .getProfileById(effectiveId)
+          .catch(() => null);
         if (mounted && prof) {
           setUserNameDisplay(
             prof.full_name ||
@@ -302,7 +185,7 @@ export default function ConnectionsScreen() {
       }
     };
 
-    init();
+    void init();
     return () => {
       mounted = false;
     };
@@ -312,7 +195,7 @@ export default function ConnectionsScreen() {
     if (nextTab === activeTab) return;
     setActiveTab(nextTab);
     if (targetUserId) {
-      loadCountsAndTabData(targetUserId, nextTab, loggedInUserId);
+      void loadCountsAndTabData(targetUserId, nextTab, loggedInUserId);
     }
   };
 
@@ -322,12 +205,7 @@ export default function ConnectionsScreen() {
       setUpdatingFollowId(targetId);
       setMyFollowingIds((prev) => Array.from(new Set([...prev, targetId])));
 
-      const { error } = await supabase.from('follows').insert({
-        follower_id: loggedInUserId,
-        following_id: targetId,
-        status: 'accepted',
-      });
-      if (error) throw error;
+      await backend.connect.followUser(loggedInUserId, targetId, false);
 
       if (targetUserId === loggedInUserId) {
         setFollowingCount((prev) => prev + 1);
@@ -347,12 +225,16 @@ export default function ConnectionsScreen() {
   };
 
   const handleMessageUser = (user: ConnectionUser) => {
+    const formattedHandle = user.username
+      ? normalizeHandle(user.username)
+      : '';
     router.push({
-      pathname: '/chat',
+      pathname: '/messages',
       params: {
         userId: user.id,
-        username: user.username || '',
-        name: user.full_name || user.username || 'User',
+        name: user.full_name || formattedHandle || 'User',
+        username: formattedHandle,
+        avatarUrl: getResolvedAvatarUri(user.avatar_url),
       },
     } as any);
   };
@@ -533,7 +415,7 @@ export default function ConnectionsScreen() {
                         {!alreadyFollowing && (
                           <TouchableOpacity
                             style={styles.followBackBtn}
-                            onPress={() => handleFollowBack(user.id)}
+                            onPress={() => void handleFollowBack(user.id)}
                             disabled={updatingFollowId === user.id}
                             activeOpacity={0.8}
                           >

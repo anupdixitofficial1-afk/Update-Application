@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   StyleSheet,
   Text,
@@ -11,15 +11,88 @@ import {
   Keyboard,
   Platform,
   Alert,
+  DeviceEventEmitter,
+  StatusBar,
+  useColorScheme,
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { router, Stack } from 'expo-router';
-import { supabase } from '../lib/supabase';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { backend } from '../lib/backend';
+
+const THEME_STORAGE_KEY = 'app_theme_mode_v1';
+const THEME_CHANGED_EVENT = 'app-theme-changed';
+const LAST_LOGIN_ID_KEY = 'vibesphere_last_login_id_v1';
+
+type ThemeMode = 'light' | 'dark' | 'system';
+type IdentifierType = 'email' | 'phone' | 'username';
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function detectIdentifierType(raw: string): IdentifierType {
+  const clean = raw.trim();
+  if (EMAIL_REGEX.test(clean.toLowerCase())) return 'email';
+  const compact = clean.replace(/[\s\-()]/g, '');
+  if (/^\+?\d{6,15}$/.test(compact)) return 'phone';
+  return 'username';
+}
 
 export default function LoginScreen() {
-  const [email, setEmail] = useState('');
-  const [emailError, setEmailError] = useState<string | null>(null);
+  const insets = useSafeAreaInsets();
+  const systemScheme = useColorScheme();
+
+  const [themeMode, setThemeMode] = useState<ThemeMode>('system');
+  const isDark =
+    themeMode === 'dark' || (themeMode === 'system' && systemScheme === 'dark');
+
+  const colors = useMemo(
+    () => ({
+      bg: isDark ? '#09090b' : '#ffffff',
+      surface: isDark ? '#18181b' : '#f4f4f5',
+      card: isDark ? '#18181b' : '#ffffff',
+      border: isDark ? '#27272a' : '#e4e4e7',
+      text: isDark ? '#fafafa' : '#09090b',
+      subtext: isDark ? '#a1a1aa' : '#71717a',
+      accent: isDark ? '#fafafa' : '#09090b',
+      accentText: isDark ? '#09090b' : '#ffffff',
+      emerald: '#10b981',
+      emeraldSoft: isDark ? 'rgba(16, 185, 129, 0.14)' : '#ecfdf5',
+      danger: '#ef4444',
+      dangerSoft: isDark ? 'rgba(239, 68, 68, 0.14)' : '#fef2f2',
+    }),
+    [isDark]
+  );
+
+  useEffect(() => {
+    AsyncStorage.getItem(THEME_STORAGE_KEY)
+      .then((saved) => {
+        if (saved === 'light' || saved === 'dark' || saved === 'system') {
+          setThemeMode(saved);
+        }
+      })
+      .catch(() => {});
+
+    AsyncStorage.getItem(LAST_LOGIN_ID_KEY)
+      .then((savedId) => {
+        if (savedId) setIdentifier(savedId);
+      })
+      .catch(() => {});
+
+    const sub = DeviceEventEmitter.addListener(
+      THEME_CHANGED_EVENT,
+      (mode: ThemeMode) => {
+        if (mode === 'light' || mode === 'dark' || mode === 'system') {
+          setThemeMode(mode);
+        }
+      }
+    );
+    return () => sub.remove();
+  }, []);
+
+  const [identifier, setIdentifier] = useState('');
+  const [countryCode, setCountryCode] = useState('+91');
+  const [identifierError, setIdentifierError] = useState<string | null>(null);
 
   const [password, setPassword] = useState('');
   const [passwordError, setPasswordError] = useState<string | null>(null);
@@ -28,331 +101,428 @@ export default function LoginScreen() {
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  // Forgot Password Modal States
-  const [forgotModalOpen, setForgotModalOpen] = useState(false);
+  const [forgotOpen, setForgotOpen] = useState(false);
   const [resetEmail, setResetEmail] = useState('');
-  const [resetEmailError, setResetEmailError] = useState<string | null>(null);
-  const [resetSuccessMsg, setResetSuccessMsg] = useState<string | null>(null);
+  const [resetError, setResetError] = useState<string | null>(null);
+  const [resetSuccess, setResetSuccess] = useState<string | null>(null);
   const [sendingReset, setSendingReset] = useState(false);
-  const [resetCooldown, setResetCooldown] = useState(0);
+  const [cooldown, setCooldown] = useState(0);
+
+  const idType = useMemo(() => detectIdentifierType(identifier), [identifier]);
 
   useEffect(() => {
-    if (resetCooldown <= 0) return;
-    const interval = setInterval(() => {
-      setResetCooldown((prev) => (prev > 1 ? prev - 1 : 0));
+    if (cooldown <= 0) return;
+    const timer = setInterval(() => {
+      setCooldown((prev) => (prev > 1 ? prev - 1 : 0));
     }, 1000);
-    return () => clearInterval(interval);
-  }, [resetCooldown]);
+    return () => clearInterval(timer);
+  }, [cooldown]);
 
-  const handleSignIn = async () => {
+  const handleLogin = async () => {
     if (submitting) return;
-
     Keyboard.dismiss();
     setFormError(null);
 
-    const trimmedEmail = email.trim().toLowerCase();
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const trimmedId = identifier.trim();
+    let invalid = false;
 
-    let hasError = false;
-
-    if (!trimmedEmail || !emailRegex.test(trimmedEmail)) {
-      setEmailError('Enter a valid email address.');
-      hasError = true;
+    if (!trimmedId) {
+      setIdentifierError('Enter your email, @username, or mobile number.');
+      invalid = true;
     } else {
-      setEmailError(null);
+      setIdentifierError(null);
     }
 
     if (!password) {
-      setPasswordError('Password is required.');
-      hasError = true;
+      setPasswordError('Enter your password.');
+      invalid = true;
     } else {
       setPasswordError(null);
     }
 
-    if (hasError) return;
+    if (invalid) return;
 
     setSubmitting(true);
-
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email: trimmedEmail,
+      const user = await backend.auth.signInWithIdentifier(
+        trimmedId,
         password,
-      });
+        countryCode
+      );
 
-      if (error || !data.user) {
-        setFormError(error?.message || 'Invalid email or password.');
-        return;
-      }
+      await AsyncStorage.setItem(LAST_LOGIN_ID_KEY, trimmedId).catch(() => {});
 
-      const { data: profile, error: profileError } = await supabase
-        .from('profiles')
-        .select('is_profile_completed')
-        .eq('id', data.user.id)
-        .maybeSingle();
-
-      const isFirstTimeSignIn =
-        profileError || !profile || profile.is_profile_completed !== true;
-
-      if (isFirstTimeSignIn) {
-        router.replace('/(tabs)/profile');
-      } else {
-        router.replace('/(tabs)');
-      }
+      const needsOnboarding = !user.isProfileCompleted;
+      router.replace(needsOnboarding ? '/(tabs)/profile' : '/(tabs)');
     } catch (err: any) {
-      setFormError(err?.message || 'Unable to sign in. Please try again.');
+      const msg = String(err?.message || 'Unable to sign in right now.');
+      if (
+        msg.toLowerCase().includes('no account') ||
+        msg.toLowerCase().includes('valid email')
+      ) {
+        setIdentifierError(msg);
+      } else {
+        setFormError(msg);
+      }
     } finally {
       setSubmitting(false);
     }
   };
 
-  const openForgotPasswordModal = () => {
-    setResetEmail(email.trim().toLowerCase());
-    setResetEmailError(null);
-    setResetSuccessMsg(null);
-    setForgotModalOpen(true);
+  const openResetSheet = () => {
+    const current = identifier.trim().toLowerCase();
+    setResetEmail(EMAIL_REGEX.test(current) ? current : '');
+    setResetError(null);
+    setResetSuccess(null);
+    setForgotOpen(true);
   };
 
-  const handleSendResetLink = async () => {
-    if (sendingReset || resetCooldown > 0) return;
+  const handleSendReset = async () => {
+    if (sendingReset || cooldown > 0) return;
 
-    const trimmed = resetEmail.trim().toLowerCase();
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-    if (!trimmed || !emailRegex.test(trimmed)) {
-      setResetEmailError('Enter a valid registered email address.');
+    const cleanEmail = resetEmail.trim().toLowerCase();
+    if (!cleanEmail || !EMAIL_REGEX.test(cleanEmail)) {
+      setResetError('Enter a valid email address.');
       return;
     }
 
-    setResetEmailError(null);
-    setResetSuccessMsg(null);
+    setResetError(null);
+    setResetSuccess(null);
     setSendingReset(true);
 
     try {
-      const { error } = await supabase.auth.resetPasswordForEmail(trimmed, {
-        redirectTo: 'vibesphere://reset-password',
-      });
+      await backend.auth.sendPasswordReset(cleanEmail);
 
-      if (error) {
-        const msg = error.message.toLowerCase();
-        if (msg.includes('rate limit') || msg.includes('too many requests')) {
-          setResetCooldown(60);
-          setResetEmailError(
-            'Too many reset requests sent. Please wait 60 seconds and try again.'
-          );
-        } else {
-          setResetEmailError(error.message || 'Unable to send reset link.');
-        }
-        return;
-      }
-
-      setResetCooldown(60);
-      setResetSuccessMsg(
-        'Password reset link sent to your email. Please check your inbox and spam folder.'
-      );
-      Alert.alert(
-        'Reset Link Sent',
-        'Check your email to reset your password.'
-      );
+      setCooldown(60);
+      setResetSuccess('Reset link sent. Check your inbox and spam folder.');
+      Alert.alert('Reset Link Sent', 'Check your email to reset your password.');
     } catch (err: any) {
-      setResetEmailError(
-        err?.message || 'Something went wrong. Please try again.'
-      );
+      const msg = String(err?.message || 'Something went wrong.');
+      const lower = msg.toLowerCase();
+      if (lower.includes('rate limit') || lower.includes('too many')) {
+        setCooldown(60);
+        setResetError('Too many requests. Wait 60s before trying again.');
+      } else {
+        setResetError(msg);
+      }
     } finally {
       setSendingReset(false);
     }
   };
 
+  const idIconName =
+    idType === 'phone'
+      ? 'call-outline'
+      : idType === 'username'
+        ? 'at-outline'
+        : 'mail-outline';
+
+  const showDialPrefix = idType === 'phone' && !identifier.trim().startsWith('+');
+
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView
+      style={[styles.screen, { backgroundColor: colors.bg }]}
+      edges={['top', 'bottom']}
+    >
       <Stack.Screen options={{ headerShown: false }} />
+      <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
 
       <KeyboardAvoidingView
+        style={styles.keyboardWrap}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        style={styles.keyboardContainer}
       >
-        {/* LOGO ICON BOX */}
-        <View style={styles.logoContainer}>
-          <View style={styles.flameIconBox}>
-            <MaterialCommunityIcons name="fire" size={32} color="#0f172a" />
+        <View style={styles.contentWrap}>
+          {/* Brand Mark */}
+          <View
+            style={[
+              styles.brandBadge,
+              { backgroundColor: colors.surface, borderColor: colors.border },
+            ]}
+          >
+            <MaterialCommunityIcons name="fire" size={28} color={colors.emerald} />
           </View>
-        </View>
 
-        {/* APP TITLE & TAGLINE */}
-        <Text style={styles.appTitle}>VibeSphere</Text>
-        <Text style={styles.appSubtitle}>
-          Sign in to continue with your account.
-        </Text>
+          <Text style={[styles.title, { color: colors.text }]}>Welcome back</Text>
+          <Text style={[styles.subtitle, { color: colors.subtext }]}>
+            Sign in with your email, @username, or mobile number
+          </Text>
 
-        {/* FORM CONTAINER */}
-        <View style={styles.formContainer}>
-          {/* EMAIL */}
-          <View style={styles.inputWrapper}>
-            <TextInput
-              style={[
-                styles.textInput,
-                emailError ? styles.inputError : null,
-              ]}
-              value={email}
-              onChangeText={(text) => {
-                setEmail(text);
-                if (emailError) setEmailError(null);
-                if (formError) setFormError(null);
-              }}
-              placeholder="Enter your email"
-              placeholderTextColor="#94a3b8"
-              keyboardType="email-address"
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-            {emailError ? (
-              <Text style={styles.errorText}>{emailError}</Text>
+          {/* Identifier Field */}
+          <View style={styles.fieldGroup}>
+            <View style={styles.rowGap}>
+              {showDialPrefix && (
+                <TextInput
+                  style={[
+                    styles.dialBox,
+                    {
+                      backgroundColor: colors.surface,
+                      borderColor: identifierError ? colors.danger : colors.border,
+                      color: colors.text,
+                    },
+                  ]}
+                  value={countryCode}
+                  onChangeText={(val) =>
+                    setCountryCode(
+                      val.startsWith('+') ? val : `+${val.replace(/\D/g, '')}`
+                    )
+                  }
+                  keyboardType="phone-pad"
+                  maxLength={5}
+                />
+              )}
+
+              <View
+                style={[
+                  styles.inputShell,
+                  { flex: 1 },
+                  {
+                    backgroundColor: identifierError
+                      ? colors.dangerSoft
+                      : colors.surface,
+                    borderColor: identifierError ? colors.danger : colors.border,
+                  },
+                ]}
+              >
+                <Ionicons name={idIconName} size={18} color={colors.subtext} />
+                <TextInput
+                  style={[styles.inputText, { color: colors.text }]}
+                  value={identifier}
+                  onChangeText={(val) => {
+                    setIdentifier(val);
+                    if (identifierError) setIdentifierError(null);
+                    if (formError) setFormError(null);
+                  }}
+                  placeholder="Email, @username, or mobile number"
+                  placeholderTextColor={colors.subtext}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+              </View>
+            </View>
+            {identifierError ? (
+              <Text style={[styles.errText, { color: colors.danger }]}>
+                {identifierError}
+              </Text>
             ) : null}
           </View>
 
-          {/* PASSWORD */}
-          <View style={styles.inputWrapper}>
+          {/* Password Field */}
+          <View style={styles.fieldGroup}>
             <View
               style={[
-                styles.inlineInputBox,
-                passwordError ? styles.inputError : null,
+                styles.inputShell,
+                {
+                  backgroundColor: passwordError
+                    ? colors.dangerSoft
+                    : colors.surface,
+                  borderColor: passwordError ? colors.danger : colors.border,
+                },
               ]}
             >
+              <Ionicons
+                name="lock-closed-outline"
+                size={18}
+                color={colors.subtext}
+              />
               <TextInput
-                style={styles.inlineTextInput}
+                style={[styles.inputText, { color: colors.text }]}
                 value={password}
-                onChangeText={(text) => {
-                  setPassword(text);
+                onChangeText={(val) => {
+                  setPassword(val);
                   if (passwordError) setPasswordError(null);
                   if (formError) setFormError(null);
                 }}
+                placeholder="Password"
+                placeholderTextColor={colors.subtext}
                 secureTextEntry={!showPassword}
-                placeholder="Enter your password"
-                placeholderTextColor="#94a3b8"
                 autoCapitalize="none"
               />
               <TouchableOpacity
                 onPress={() => setShowPassword((prev) => !prev)}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
               >
                 <Ionicons
                   name={showPassword ? 'eye-off-outline' : 'eye-outline'}
-                  size={18}
-                  color="#64748b"
+                  size={19}
+                  color={colors.subtext}
                 />
               </TouchableOpacity>
             </View>
             {passwordError ? (
-              <Text style={styles.errorText}>{passwordError}</Text>
+              <Text style={[styles.errText, { color: colors.danger }]}>
+                {passwordError}
+              </Text>
             ) : null}
           </View>
 
-          {/* FORGOT PASSWORD LINK */}
-          <View style={styles.forgotRow}>
-            <TouchableOpacity
-              onPress={openForgotPasswordModal}
-              activeOpacity={0.75}
-            >
-              <Text style={styles.forgotPasswordText}>Forgot Password?</Text>
-            </TouchableOpacity>
-          </View>
+          {/* Forgot Password */}
+          <TouchableOpacity
+            style={styles.forgotBtn}
+            onPress={openResetSheet}
+            activeOpacity={0.75}
+          >
+            <Text style={[styles.forgotText, { color: colors.text }]}>
+              Forgot password?
+            </Text>
+          </TouchableOpacity>
 
           {formError ? (
-            <Text style={styles.errorText}>{formError}</Text>
+            <Text
+              style={[
+                styles.errText,
+                { color: colors.danger, marginBottom: 12 },
+              ]}
+            >
+              {formError}
+            </Text>
           ) : null}
 
-          {/* SIGN IN BUTTON */}
+          {/* Primary Action */}
           <TouchableOpacity
-            style={[styles.loginBtn, submitting && { opacity: 0.7 }]}
-            onPress={handleSignIn}
+            style={[
+              styles.submitBtn,
+              { backgroundColor: colors.accent },
+              submitting && { opacity: 0.7 },
+            ]}
+            onPress={() => void handleLogin()}
             activeOpacity={0.85}
             disabled={submitting}
           >
             {submitting ? (
-              <ActivityIndicator color="#ffffff" />
+              <ActivityIndicator color={colors.accentText} />
             ) : (
-              <Text style={styles.loginBtnText}>Log In</Text>
+              <Text
+                style={[styles.submitBtnText, { color: colors.accentText }]}
+              >
+                Log In
+              </Text>
             )}
           </TouchableOpacity>
-        </View>
 
-        {/* FOOTER SIGN UP LINK */}
-        <View style={styles.footerContainer}>
-          <Text style={styles.footerText}>
-            Don&apos;t have an account?{' '}
-            <Text
-              style={styles.signUpLinkText}
-              onPress={() => router.replace('/signup')}
-            >
-              Create Account
+          {/* Sign Up Footer */}
+          <View style={styles.footer}>
+            <Text style={[styles.footerMuted, { color: colors.subtext }]}>
+              New to VibeSphere?{' '}
+              <Text
+                style={[styles.footerAction, { color: colors.text }]}
+                onPress={() => router.replace('/signup')}
+              >
+                Create account
+              </Text>
             </Text>
-          </Text>
+          </View>
         </View>
       </KeyboardAvoidingView>
 
-      {/* FORGOT PASSWORD MODAL */}
+      {/* RESET PASSWORD SHEET */}
       <Modal
-        visible={forgotModalOpen}
+        visible={forgotOpen}
         transparent
         animationType="slide"
-        onRequestClose={() => !sendingReset && setForgotModalOpen(false)}
+        onRequestClose={() => {
+          if (!sendingReset) setForgotOpen(false);
+        }}
       >
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalSheet}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Reset Password</Text>
+        <View style={styles.sheetBackdrop}>
+          <TouchableOpacity
+            style={{ flex: 1 }}
+            activeOpacity={1}
+            onPress={() => !sendingReset && setForgotOpen(false)}
+          />
+          <View
+            style={[
+              styles.sheetCard,
+              {
+                backgroundColor: colors.card,
+                borderTopColor: colors.border,
+                paddingBottom: Math.max(insets.bottom, 20) + 10,
+              },
+            ]}
+          >
+            <View
+              style={[styles.sheetHandle, { backgroundColor: colors.border }]}
+            />
+            <View style={styles.sheetHeader}>
+              <Text style={[styles.sheetTitle, { color: colors.text }]}>
+                Reset password
+              </Text>
               <TouchableOpacity
-                onPress={() => !sendingReset && setForgotModalOpen(false)}
+                onPress={() => !sendingReset && setForgotOpen(false)}
               >
-                <Ionicons name="close" size={22} color="#0f172a" />
+                <Ionicons name="close" size={22} color={colors.text} />
               </TouchableOpacity>
             </View>
 
-            <Text style={styles.modalSubtitle}>
-              Enter your registered email address and we will send you a
-              password reset link.
+            <Text style={[styles.sheetSub, { color: colors.subtext }]}>
+              Enter your registered email to receive a reset link.
             </Text>
 
-            <TextInput
+            <View
               style={[
-                styles.textInput,
-                resetEmailError ? styles.inputError : null,
+                styles.inputShell,
+                {
+                  backgroundColor: colors.surface,
+                  borderColor: resetError ? colors.danger : colors.border,
+                  marginBottom: 10,
+                },
               ]}
-              value={resetEmail}
-              onChangeText={(text) => {
-                setResetEmail(text);
-                if (resetEmailError) setResetEmailError(null);
-                if (resetSuccessMsg) setResetSuccessMsg(null);
-              }}
-              placeholder="Enter your email address"
-              placeholderTextColor="#94a3b8"
-              keyboardType="email-address"
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
+            >
+              <Ionicons name="mail-outline" size={18} color={colors.subtext} />
+              <TextInput
+                style={[styles.inputText, { color: colors.text }]}
+                value={resetEmail}
+                onChangeText={(val) => {
+                  setResetEmail(val);
+                  if (resetError) setResetError(null);
+                  if (resetSuccess) setResetSuccess(null);
+                }}
+                placeholder="you@example.com"
+                placeholderTextColor={colors.subtext}
+                keyboardType="email-address"
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+            </View>
 
-            {resetEmailError ? (
-              <Text style={styles.errorText}>{resetEmailError}</Text>
+            {resetError ? (
+              <Text
+                style={[
+                  styles.errText,
+                  { color: colors.danger, marginBottom: 10 },
+                ]}
+              >
+                {resetError}
+              </Text>
             ) : null}
 
-            {resetSuccessMsg ? (
-              <Text style={styles.successText}>{resetSuccessMsg}</Text>
+            {resetSuccess ? (
+              <Text
+                style={[
+                  styles.okText,
+                  { color: colors.emerald, marginBottom: 10 },
+                ]}
+              >
+                {resetSuccess}
+              </Text>
             ) : null}
 
             <TouchableOpacity
               style={[
-                styles.loginBtn,
-                (sendingReset || resetCooldown > 0) && { opacity: 0.7 },
+                styles.submitBtn,
+                { backgroundColor: colors.accent },
+                (sendingReset || cooldown > 0) && { opacity: 0.7 },
               ]}
-              onPress={handleSendResetLink}
+              onPress={() => void handleSendReset()}
               activeOpacity={0.85}
-              disabled={sendingReset || resetCooldown > 0}
+              disabled={sendingReset || cooldown > 0}
             >
               {sendingReset ? (
-                <ActivityIndicator color="#ffffff" />
+                <ActivityIndicator color={colors.accentText} />
               ) : (
-                <Text style={styles.loginBtnText}>
-                  {resetCooldown > 0
-                    ? `Resend in ${resetCooldown}s`
-                    : 'Send Reset Link'}
+                <Text
+                  style={[styles.submitBtnText, { color: colors.accentText }]}
+                >
+                  {cooldown > 0 ? `Resend in ${cooldown}s` : 'Send Reset Link'}
                 </Text>
               )}
             </TouchableOpacity>
@@ -364,167 +534,137 @@ export default function LoginScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
+  screen: { flex: 1 },
+  keyboardWrap: { flex: 1 },
+  contentWrap: {
     flex: 1,
-    backgroundColor: '#ffffff',
-  },
-  keyboardContainer: {
-    flex: 1,
-    alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 28,
+    paddingHorizontal: 24,
   },
-  logoContainer: {
-    alignItems: 'center',
-    marginBottom: 14,
-  },
-  flameIconBox: {
-    width: 64,
-    height: 64,
+  brandBadge: {
+    width: 60,
+    height: 60,
     borderRadius: 18,
-    backgroundColor: '#34d399',
-    justifyContent: 'center',
+    borderWidth: 1,
+    alignSelf: 'center',
     alignItems: 'center',
-    shadowColor: '#10b981',
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.35,
-    shadowRadius: 10,
-    elevation: 6,
+    justifyContent: 'center',
+    marginBottom: 16,
   },
-  appTitle: {
+  title: {
     fontSize: 26,
-    fontWeight: '900',
-    color: '#0f172a',
+    fontWeight: '800',
     letterSpacing: -0.5,
     textAlign: 'center',
-    marginBottom: 6,
   },
-  appSubtitle: {
-    fontSize: 12.5,
-    color: '#64748b',
+  subtitle: {
+    fontSize: 13.5,
     textAlign: 'center',
-    marginBottom: 26,
-    fontWeight: '500',
+    marginTop: 6,
+    marginBottom: 24,
+    lineHeight: 19,
   },
-  formContainer: {
-    width: '100%',
-    maxWidth: 360,
-  },
-  inputWrapper: {
+  fieldGroup: {
     marginBottom: 14,
   },
-  textInput: {
-    backgroundColor: '#f8fafc',
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 13,
-    fontSize: 13,
-    color: '#0f172a',
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-  },
-  inlineInputBox: {
+  rowGap: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#f8fafc',
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 13,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
     gap: 8,
   },
-  inlineTextInput: {
-    flex: 1,
-    fontSize: 13,
-    color: '#0f172a',
-    paddingVertical: 0,
-  },
-  inputError: {
-    borderColor: '#ef4444',
-    backgroundColor: '#fef2f2',
-  },
-  forgotRow: {
-    alignItems: 'flex-end',
-    marginBottom: 14,
-    marginTop: -4,
-  },
-  forgotPasswordText: {
-    fontSize: 12,
+  dialBox: {
+    width: 66,
+    height: 48,
+    borderRadius: 12,
+    borderWidth: 1,
+    fontSize: 14,
     fontWeight: '700',
-    color: '#10b981',
+    textAlign: 'center',
   },
-  errorText: {
-    color: '#ef4444',
-    fontSize: 11.5,
+  inputShell: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    minHeight: 48,
+    borderRadius: 12,
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    gap: 10,
+  },
+  inputText: {
+    flex: 1,
+    fontSize: 14.5,
+    paddingVertical: 11,
+  },
+  forgotBtn: {
+    alignSelf: 'flex-end',
+    marginBottom: 16,
+  },
+  forgotText: {
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  errText: {
+    fontSize: 12,
     fontWeight: '600',
     marginTop: 5,
     paddingLeft: 2,
   },
-  successText: {
-    color: '#10b981',
-    fontSize: 11.5,
+  okText: {
+    fontSize: 12,
     fontWeight: '700',
-    marginTop: 6,
     paddingLeft: 2,
   },
-  loginBtn: {
-    backgroundColor: '#10b981',
-    borderRadius: 14,
-    paddingVertical: 15,
+  submitBtn: {
+    height: 48,
+    borderRadius: 12,
     alignItems: 'center',
-    marginTop: 6,
-    shadowColor: '#10b981',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 4,
+    justifyContent: 'center',
   },
-  loginBtnText: {
-    fontSize: 14.5,
-    fontWeight: '800',
-    color: '#ffffff',
-    letterSpacing: 0.3,
-  },
-  footerContainer: {
-    marginTop: 24,
-    alignItems: 'center',
-  },
-  footerText: {
-    fontSize: 12.5,
-    color: '#64748b',
-    fontWeight: '500',
-  },
-  signUpLinkText: {
-    color: '#10b981',
+  submitBtnText: {
+    fontSize: 15,
     fontWeight: '800',
   },
-  modalBackdrop: {
+  footer: {
+    marginTop: 22,
+    alignItems: 'center',
+  },
+  footerMuted: {
+    fontSize: 13.5,
+  },
+  footerAction: {
+    fontWeight: '800',
+  },
+  sheetBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(15, 23, 42, 0.45)',
+    backgroundColor: 'rgba(9, 9, 11, 0.52)',
     justifyContent: 'flex-end',
   },
-  modalSheet: {
-    backgroundColor: '#ffffff',
-    borderTopLeftRadius: 22,
-    borderTopRightRadius: 22,
-    padding: 20,
-    paddingBottom: 30,
+  sheetCard: {
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    borderTopWidth: 1,
+    paddingHorizontal: 20,
+    paddingTop: 10,
   },
-  modalHeader: {
+  sheetHandle: {
+    width: 38,
+    height: 4,
+    borderRadius: 2,
+    alignSelf: 'center',
+    marginBottom: 14,
+  },
+  sheetHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 8,
+    marginBottom: 6,
   },
-  modalTitle: {
-    fontSize: 16,
+  sheetTitle: {
+    fontSize: 17,
     fontWeight: '800',
-    color: '#0f172a',
   },
-  modalSubtitle: {
-    fontSize: 12.5,
-    color: '#64748b',
+  sheetSub: {
+    fontSize: 13,
     lineHeight: 18,
     marginBottom: 14,
   },
